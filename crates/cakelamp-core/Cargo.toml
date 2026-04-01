@@ -1,0 +1,8 @@
+[package]
+name = "cakelamp-core"
+version = "0.1.0"
+edition = "2021"
+description = "CakeLamp: A lightweight tensor library with f32-only storage"
+
+[dependencies]
+rand = "0.8"

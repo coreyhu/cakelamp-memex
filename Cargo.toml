@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/cakelamp-core"]
+resolver = "2"
