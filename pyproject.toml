@@ -1,0 +1,20 @@
+[project]
+name = "cakelamp"
+version = "0.1.0"
+description = "A lightweight tensor library with automatic differentiation"
+requires-python = ">=3.10"
+dependencies = ["pytest"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+pythonpath = ["python"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["python"]
