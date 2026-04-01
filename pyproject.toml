@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cakelamp"
+version = "0.1.0"
+description = "CakeLamp: A lightweight tensor library"
+requires-python = ">=3.9"
+
+[tool.maturin]
+manifest-path = "crates/cakelamp-python/Cargo.toml"
+features = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

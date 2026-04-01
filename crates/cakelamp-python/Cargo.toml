@@ -1,0 +1,12 @@
+[package]
+name = "cakelamp-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cakelamp"
+crate-type = ["cdylib"]
+
+[dependencies]
+cakelamp-core = { path = "../cakelamp-core" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
