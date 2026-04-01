@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cakelamp"
+version = "0.1.0"
+description = "A lightweight tensor library with Rust backend"
+requires-python = ">=3.9"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=7.0", "maturin>=1.0"]
+
+[tool.maturin]
+manifest-path = "crates/cakelamp-core/Cargo.toml"
+features = ["pyo3"]
+module-name = "cakelamp._core"
+python-source = "python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

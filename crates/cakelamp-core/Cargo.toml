@@ -6,3 +6,12 @@ description = "CakeLamp: A lightweight tensor library with f32-only storage"
 
 [dependencies]
 rand = "0.8"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+pyo3 = ["dep:pyo3"]
+
+[lib]
+name = "cakelamp_core"
+crate-type = ["lib", "cdylib"]
