@@ -342,9 +342,12 @@ pub fn argmax(a: &Tensor, dim: usize) -> Tensor {
 /// Matrix multiplication for 2D tensors.
 /// a: (M, K), b: (K, N) -> result: (M, N)
 ///
-/// Uses ikj loop order for cache-friendly access patterns:
-/// - Inner loop traverses columns of result and B contiguously in memory.
-/// - This avoids cache misses from column-striding through B (as in ijk order).
+/// Uses cache-friendly tiled ikj loop ordering:
+/// - Tile size (32) chosen to keep 3 tiles (A, B, result) in L1 cache (~32KB).
+///   3 * 32 * 32 * 4 bytes = 12KB, well within L1.
+/// - ikj order ensures sequential memory access for both B and result rows.
+/// - Tiling ensures temporal locality: each tile of B is reused across
+///   multiple rows of A before being evicted from cache.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.ndim(), 2, "matmul requires 2D tensors");
     assert_eq!(b.ndim(), 2, "matmul requires 2D tensors");
@@ -353,22 +356,40 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let n = b.shape()[1];
     assert_eq!(k, b.shape()[0], "Inner dimensions must match for matmul");
 
-    let a_data = a.to_vec();
+    let a_data = a.contiguous().to_vec();
     let b_data = b.contiguous().to_vec();
     let mut result = vec![0.0f32; m * n];
 
-    // ikj loop order: for each row i, accumulate a[i,p] * b[p,:] into result[i,:]
-    // This makes the inner loop stride contiguously through both result and b_data.
-    for i in 0..m {
-        let res_row = i * n;
-        let a_row = i * k;
-        for p in 0..k {
-            let a_val = a_data[a_row + p];
-            let b_row = p * n;
-            for j in 0..n {
-                result[res_row + j] += a_val * b_data[b_row + j];
+    // Tile size for L1 cache locality
+    const TILE: usize = 32;
+
+    // Tiled ikj loop: outer loops iterate tiles, inner loops within tiles.
+    let mut ii = 0;
+    while ii < m {
+        let i_end = (ii + TILE).min(m);
+        let mut pp = 0;
+        while pp < k {
+            let p_end = (pp + TILE).min(k);
+            let mut jj = 0;
+            while jj < n {
+                let j_end = (jj + TILE).min(n);
+                // Inner tile: ikj order for cache-friendly access
+                for i in ii..i_end {
+                    let a_row = i * k;
+                    let r_row = i * n;
+                    for p in pp..p_end {
+                        let a_val = a_data[a_row + p];
+                        let b_row = p * n;
+                        for j in jj..j_end {
+                            result[r_row + j] += a_val * b_data[b_row + j];
+                        }
+                    }
+                }
+                jj += TILE;
             }
+            pp += TILE;
         }
+        ii += TILE;
     }
 
     Tensor::from_data(result, vec![m, n])
@@ -401,14 +422,20 @@ pub fn bmm(a: &Tensor, b: &Tensor) -> Tensor {
     let b_data = b.contiguous().to_vec();
     let mut result = vec![0.0f32; batch * m * n];
 
+    // Use cache-friendly ikj loop order for each batch element
     for bi in 0..batch {
+        let a_offset = bi * m * k;
+        let b_offset = bi * k * n;
+        let r_offset = bi * m * n;
         for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0f32;
-                for p in 0..k {
-                    s += a_data[bi * m * k + i * k + p] * b_data[bi * k * n + p * n + j];
+            let a_row = a_offset + i * k;
+            let r_row = r_offset + i * n;
+            for p in 0..k {
+                let a_val = a_data[a_row + p];
+                let b_row = b_offset + p * n;
+                for j in 0..n {
+                    result[r_row + j] += a_val * b_data[b_row + j];
                 }
-                result[bi * m * n + i * n + j] = s;
             }
         }
     }
