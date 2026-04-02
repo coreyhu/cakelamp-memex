@@ -6,6 +6,20 @@ use crate::tensor::Tensor;
 // ---- Element-wise binary ops with broadcasting ----
 
 fn binary_op_broadcast(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> Tensor {
+    // Fast path: same shape, both contiguous — skip broadcasting entirely
+    if a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous() {
+        let a_storage = a.storage.borrow();
+        let b_storage = b.storage.borrow();
+        let n = a.numel();
+        let a_off = a.storage_offset;
+        let b_off = b.storage_offset;
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            result.push(f(a_storage.data[a_off + i], b_storage.data[b_off + i]));
+        }
+        return Tensor::from_data(result, a.shape().to_vec());
+    }
+
     let out_shape = broadcast_shape(a.shape(), b.shape())
         .expect("Shapes are not broadcastable");
 
@@ -43,9 +57,18 @@ fn binary_op_broadcast(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> T
 }
 
 fn unary_op(a: &Tensor, f: impl Fn(f32) -> f32) -> Tensor {
-    let data = a.to_vec();
-    let result: Vec<f32> = data.iter().map(|&x| f(x)).collect();
-    Tensor::from_data(result, a.shape().to_vec())
+    if a.is_contiguous() {
+        // Fast path: directly map over contiguous storage without to_vec() copy
+        let storage = a.storage.borrow();
+        let start = a.storage_offset;
+        let end = start + a.numel();
+        let result: Vec<f32> = storage.data[start..end].iter().map(|&x| f(x)).collect();
+        Tensor::from_data(result, a.shape().to_vec())
+    } else {
+        let data = a.to_vec();
+        let result: Vec<f32> = data.iter().map(|&x| f(x)).collect();
+        Tensor::from_data(result, a.shape().to_vec())
+    }
 }
 
 // ---- Element-wise arithmetic ----
@@ -318,6 +341,10 @@ pub fn argmax(a: &Tensor, dim: usize) -> Tensor {
 
 /// Matrix multiplication for 2D tensors.
 /// a: (M, K), b: (K, N) -> result: (M, N)
+///
+/// Uses ikj loop order for cache-friendly access patterns:
+/// - Inner loop traverses columns of result and B contiguously in memory.
+/// - This avoids cache misses from column-striding through B (as in ijk order).
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.ndim(), 2, "matmul requires 2D tensors");
     assert_eq!(b.ndim(), 2, "matmul requires 2D tensors");
@@ -330,13 +357,17 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let b_data = b.contiguous().to_vec();
     let mut result = vec![0.0f32; m * n];
 
+    // ikj loop order: for each row i, accumulate a[i,p] * b[p,:] into result[i,:]
+    // This makes the inner loop stride contiguously through both result and b_data.
     for i in 0..m {
-        for j in 0..n {
-            let mut s = 0.0f32;
-            for p in 0..k {
-                s += a_data[i * k + p] * b_data[p * n + j];
+        let res_row = i * n;
+        let a_row = i * k;
+        for p in 0..k {
+            let a_val = a_data[a_row + p];
+            let b_row = p * n;
+            for j in 0..n {
+                result[res_row + j] += a_val * b_data[b_row + j];
             }
-            result[i * n + j] = s;
         }
     }
 
@@ -466,10 +497,94 @@ pub fn softmax(a: &Tensor, dim: usize) -> Tensor {
     Tensor::from_data(result, shape.to_vec())
 }
 
-/// Log-softmax along a dimension.
+/// Log-softmax along a dimension (fused for numerical stability).
+///
+/// Computes log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
+/// in a single fused pass instead of computing softmax then log.
+/// This avoids:
+/// 1. An extra allocation for the softmax intermediate
+/// 2. A redundant pass through the data
+/// 3. Numerical issues from taking log of very small softmax values
 pub fn log_softmax(a: &Tensor, dim: usize) -> Tensor {
-    let sm = softmax(a, dim);
-    log(&sm)
+    let shape = a.shape();
+    let data = a.to_vec();
+    let strides = Tensor::compute_contiguous_strides(shape);
+    let ndim = shape.len();
+
+    let mut out_shape = shape.to_vec();
+    out_shape[dim] = 1;
+    let out_numel: usize = out_shape.iter().product();
+    let out_strides = Tensor::compute_contiguous_strides(&out_shape);
+    let total: usize = shape.iter().product();
+
+    // Pass 1: find max along dim (same as softmax)
+    let mut maxes = vec![f32::NEG_INFINITY; out_numel];
+    let mut coord = vec![0usize; ndim];
+    for _ in 0..total {
+        let mut in_idx = 0;
+        let mut out_idx = 0;
+        for d in 0..ndim {
+            in_idx += coord[d] * strides[d];
+            if d != dim {
+                out_idx += coord[d] * out_strides[d];
+            }
+        }
+        if data[in_idx] > maxes[out_idx] {
+            maxes[out_idx] = data[in_idx];
+        }
+        for d in (0..ndim).rev() {
+            coord[d] += 1;
+            if coord[d] < shape[d] { break; }
+            coord[d] = 0;
+        }
+    }
+
+    // Pass 2: compute sum(exp(x - max))
+    let mut log_sums = vec![0.0f32; out_numel];
+    coord = vec![0usize; ndim];
+    for _ in 0..total {
+        let mut in_idx = 0;
+        let mut out_idx = 0;
+        for d in 0..ndim {
+            in_idx += coord[d] * strides[d];
+            if d != dim {
+                out_idx += coord[d] * out_strides[d];
+            }
+        }
+        log_sums[out_idx] += (data[in_idx] - maxes[out_idx]).exp();
+        for d in (0..ndim).rev() {
+            coord[d] += 1;
+            if coord[d] < shape[d] { break; }
+            coord[d] = 0;
+        }
+    }
+
+    // Convert sums to log(sums)
+    for s in log_sums.iter_mut() {
+        *s = s.ln();
+    }
+
+    // Pass 3: result = x - max - log_sum
+    let mut result = vec![0.0f32; total];
+    coord = vec![0usize; ndim];
+    for flat_i in 0..total {
+        let mut in_idx = 0;
+        let mut out_idx = 0;
+        for d in 0..ndim {
+            in_idx += coord[d] * strides[d];
+            if d != dim {
+                out_idx += coord[d] * out_strides[d];
+            }
+        }
+        result[flat_i] = data[in_idx] - maxes[out_idx] - log_sums[out_idx];
+        for d in (0..ndim).rev() {
+            coord[d] += 1;
+            if coord[d] < shape[d] { break; }
+            coord[d] = 0;
+        }
+    }
+
+    Tensor::from_data(result, shape.to_vec())
 }
 
 // ---- Gather / indexing ----
