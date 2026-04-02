@@ -1,10 +1,14 @@
 """Loss function modules for CakeLamp nn.
 
 Provides common loss functions needed for training neural networks.
+All loss functions are autograd-compatible — they work with AutogradTensor
+and support backward pass for gradient computation.
 """
 
 from __future__ import annotations
 
+import cakelamp._core as _C
+from cakelamp.autograd.tensor import AutogradTensor
 from cakelamp.nn.module import Module
 
 
@@ -12,125 +16,56 @@ class MSELoss(Module):
     """Mean Squared Error loss.
 
     ``loss = mean((input - target)^2)``
-
-    Parameters
-    ----------
-    reduction : str
-        Specifies the reduction to apply: ``'mean'`` (default),
-        ``'sum'``, or ``'none'``.
     """
 
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        if reduction not in ("mean", "sum", "none"):
-            raise ValueError(
-                f"Invalid reduction mode: {reduction}. "
-                "Must be 'mean', 'sum', or 'none'."
-            )
-        self.reduction = reduction
-
     def forward(self, input, target):
-        diff = input.sub(target)
-        sq = diff.mul(diff)
-        if self.reduction == "mean":
-            return sq.mean()
-        elif self.reduction == "sum":
-            return sq.sum()
-        else:
-            return sq
+        diff = input - target
+        return (diff * diff).mean()
 
     def extra_repr(self) -> str:
-        return f"reduction='{self.reduction}'"
+        return ""
 
 
 class NLLLoss(Module):
     """Negative Log Likelihood loss.
 
     Expects log-probabilities as input (e.g., from LogSoftmax).
-
-    ``loss = -sum(log_probs[i, target[i]]) / N``
-
-    Parameters
-    ----------
-    reduction : str
-        ``'mean'`` (default), ``'sum'``, or ``'none'``.
+    target: 1D tensor of class indices (as floats).
     """
 
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        if reduction not in ("mean", "sum", "none"):
-            raise ValueError(
-                f"Invalid reduction mode: {reduction}. "
-                "Must be 'mean', 'sum', or 'none'."
-            )
-        self.reduction = reduction
+    def forward(self, log_probs, target):
+        batch_size = log_probs.shape[0]
+        num_classes = log_probs.shape[1]
 
-    def forward(self, input, target):
-        """Compute NLL loss.
+        target_data = target.data if isinstance(target, AutogradTensor) else target
+        target_oh = AutogradTensor(
+            _C.one_hot(target_data, num_classes),
+            requires_grad=False,
+        )
 
-        Parameters
-        ----------
-        input : Tensor
-            Log-probabilities of shape ``(N, C)``.
-        target : Tensor
-            Target class indices of shape ``(N,)`` with integer values.
-        """
-        # Gather the log-probability for each target class.
-        # nll = -input[i, target[i]] for each sample i
-        nll = input.nll_gather(target)
-
-        if self.reduction == "mean":
-            return nll.mean()
-        elif self.reduction == "sum":
-            return nll.sum()
-        else:
-            return nll
-
-    def extra_repr(self) -> str:
-        return f"reduction='{self.reduction}'"
+        selected = log_probs * target_oh
+        loss = -selected.sum() / AutogradTensor.from_scalar(float(batch_size))
+        return loss
 
 
 class CrossEntropyLoss(Module):
-    """Cross Entropy loss.
+    """Cross Entropy loss = log_softmax + NLL.
 
-    Combines LogSoftmax and NLLLoss in one step for numerical stability.
-
-    ``loss = -sum(log_softmax(input)[i, target[i]]) / N``
-
-    Parameters
-    ----------
-    reduction : str
-        ``'mean'`` (default), ``'sum'``, or ``'none'``.
+    Expects raw logits as input.
+    target: 1D tensor of class indices (as floats).
     """
 
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        if reduction not in ("mean", "sum", "none"):
-            raise ValueError(
-                f"Invalid reduction mode: {reduction}. "
-                "Must be 'mean', 'sum', or 'none'."
-            )
-        self.reduction = reduction
+    def forward(self, logits, target):
+        log_probs = logits.log_softmax(dim=1)
+        batch_size = logits.shape[0]
+        num_classes = logits.shape[1]
 
-    def forward(self, input, target):
-        """Compute cross entropy loss.
+        target_data = target.data if isinstance(target, AutogradTensor) else target
+        target_oh = AutogradTensor(
+            _C.one_hot(target_data, num_classes),
+            requires_grad=False,
+        )
 
-        Parameters
-        ----------
-        input : Tensor
-            Raw logits of shape ``(N, C)``.
-        target : Tensor
-            Target class indices of shape ``(N,)`` with integer values.
-        """
-        log_probs = input.log_softmax(dim=1)
-        nll = log_probs.nll_gather(target)
-
-        if self.reduction == "mean":
-            return nll.mean()
-        elif self.reduction == "sum":
-            return nll.sum()
-        else:
-            return nll
-
-    def extra_repr(self) -> str:
-        return f"reduction='{self.reduction}'"
+        selected = log_probs * target_oh
+        loss = -selected.sum() / AutogradTensor.from_scalar(float(batch_size))
+        return loss
