@@ -1,26 +1,19 @@
-"""MNIST dataset loader.
+"""MNIST dataset loader for CakeLamp.
 
-Pure Python parsing of the IDX file format. Downloads MNIST data
-from the web if not already cached locally.
-
-IDX file format:
-  - 4 bytes: magic number (big-endian)
-  - 4 bytes: number of items (big-endian)
-  - For images: 4 bytes rows, 4 bytes cols, then row*col bytes per image
-  - For labels: 1 byte per label
+Pure-Python IDX format parser. Downloads MNIST from the web if not cached.
+Returns data as flat Python lists ready for use with _C.Tensor.
 """
 
 from __future__ import annotations
 
 import gzip
 import os
+import random
 import struct
 import urllib.request
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Tuple, List
 
-
-# MNIST mirror URLs
+# Mirror URLs for MNIST (original site is sometimes unreliable)
 _MNIST_URLS = {
     "train-images": "https://ossci-datasets.s3.amazonaws.com/mnist/train-images-idx3-ubyte.gz",
     "train-labels": "https://ossci-datasets.s3.amazonaws.com/mnist/train-labels-idx1-ubyte.gz",
@@ -29,56 +22,43 @@ _MNIST_URLS = {
 }
 
 
-def _download_file(url: str, dest: Path) -> None:
+def _download(url: str, path: str) -> None:
     """Download a file if it doesn't exist."""
-    if dest.exists():
+    if os.path.exists(path):
         return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {url} ...")
-    urllib.request.urlretrieve(url, str(dest))
-    print(f"  -> saved to {dest}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    print(f"Downloading {url} -> {path}")
+    urllib.request.urlretrieve(url, path)
 
 
-def _read_idx_images(path: Path) -> Tuple[List[List[float]], int, int, int]:
-    """Read IDX image file and return (flat_images, n, rows, cols).
-
-    Each image is a flat list of float32 values normalised to [0, 1].
-    """
+def _read_idx_images(path) -> Tuple[List[List[float]], int, int, int]:
+    """Read IDX image file, return (images_as_flat_float_lists, n, rows, cols)."""
     with gzip.open(str(path), "rb") as f:
-        magic = struct.unpack(">I", f.read(4))[0]
+        magic, n, rows, cols = struct.unpack(">IIII", f.read(16))
         if magic != 2051:
             raise ValueError(f"Invalid magic number for images: {magic}")
-        n = struct.unpack(">I", f.read(4))[0]
-        rows = struct.unpack(">I", f.read(4))[0]
-        cols = struct.unpack(">I", f.read(4))[0]
+        data = f.read()
 
-        images = []
-        pixel_count = rows * cols
-        for _ in range(n):
-            raw = f.read(pixel_count)
-            if len(raw) != pixel_count:
-                raise ValueError("Unexpected EOF while reading images")
-            # Normalise to [0, 1]
-            img = [b / 255.0 for b in raw]
-            images.append(img)
+    images = []
+    img_size = rows * cols
+    for i in range(n):
+        offset = i * img_size
+        pixels = data[offset : offset + img_size]
+        # Normalize to [0, 1]
+        images.append([p / 255.0 for p in pixels])
 
     return images, n, rows, cols
 
 
-def _read_idx_labels(path: Path) -> List[int]:
-    """Read IDX label file and return list of integer labels."""
+def _read_idx_labels(path) -> List[int]:
+    """Read IDX label file, return list of int labels."""
     with gzip.open(str(path), "rb") as f:
-        magic = struct.unpack(">I", f.read(4))[0]
+        magic, n = struct.unpack(">II", f.read(8))
         if magic != 2049:
             raise ValueError(f"Invalid magic number for labels: {magic}")
-        n = struct.unpack(">I", f.read(4))[0]
+        data = f.read()
 
-        raw = f.read(n)
-        if len(raw) != n:
-            raise ValueError("Unexpected EOF while reading labels")
-        labels = list(raw)
-
-    return labels
+    return [b for b in data[:n]]
 
 
 class MNISTDataset:
@@ -87,7 +67,7 @@ class MNISTDataset:
     Parameters
     ----------
     images : list[list[float]]
-        Each image is a flat list of 784 floats in [0, 1].
+        Each image is a flat list of floats in [0, 1].
     labels : list[int]
         Integer labels 0-9.
     """
@@ -108,15 +88,12 @@ class MNISTDataset:
         batch_size : int
             Number of samples per batch.
         shuffle : bool
-            Whether to shuffle the dataset each epoch.
+            Whether to shuffle indices each time.
 
         Yields
         ------
         tuple[list[list[float]], list[int]]
-            Batch of images (flat lists) and labels.
         """
-        import random
-
         indices = list(range(len(self.images)))
         if shuffle:
             random.shuffle(indices)
@@ -129,51 +106,67 @@ class MNISTDataset:
 
 
 def load_mnist(
-    data_dir: Optional[str] = None,
+    data_dir: str = "./data/mnist",
     download: bool = True,
-) -> Tuple[MNISTDataset, MNISTDataset]:
-    """Load the MNIST dataset.
+    train: bool = True,
+    limit: int = 0,
+) -> Tuple[List[List[float]], List[int]]:
+    """Load MNIST dataset.
 
     Parameters
     ----------
-    data_dir : str, optional
-        Directory to store/load data. Defaults to ``./data/mnist``.
+    data_dir : str
+        Directory to cache downloaded files.
     download : bool
-        Whether to download data if not present (default: True).
+        If True, download MNIST if not found locally.
+    train : bool
+        If True, load training set (60k); otherwise test set (10k).
+    limit : int
+        If > 0, only return first ``limit`` samples.
 
     Returns
     -------
-    tuple[MNISTDataset, MNISTDataset]
-        (train_dataset, test_dataset)
+    images : list of list of float
+        Each image is a flat list of 784 floats in [0, 1].
+    labels : list of int
+        Integer labels 0-9.
     """
-    if data_dir is None:
-        data_dir = os.path.join(".", "data", "mnist")
-    data_path = Path(data_dir)
+    prefix = "train" if train else "test"
+    img_key = f"{prefix}-images"
+    lbl_key = f"{prefix}-labels"
 
-    # File paths
-    files = {
-        "train-images": data_path / "train-images-idx3-ubyte.gz",
-        "train-labels": data_path / "train-labels-idx1-ubyte.gz",
-        "test-images": data_path / "t10k-images-idx3-ubyte.gz",
-        "test-labels": data_path / "t10k-labels-idx1-ubyte.gz",
-    }
+    img_path = os.path.join(data_dir, f"{img_key}.gz")
+    lbl_path = os.path.join(data_dir, f"{lbl_key}.gz")
 
     if download:
-        for key, path in files.items():
-            _download_file(_MNIST_URLS[key], path)
+        _download(_MNIST_URLS[img_key], img_path)
+        _download(_MNIST_URLS[lbl_key], lbl_path)
 
-    # Parse IDX files
-    train_images, n_train, rows, cols = _read_idx_images(files["train-images"])
-    train_labels = _read_idx_labels(files["train-labels"])
-    test_images, n_test, _, _ = _read_idx_images(files["test-images"])
-    test_labels = _read_idx_labels(files["test-labels"])
+    images, n, rows, cols = _read_idx_images(img_path)
+    labels = _read_idx_labels(lbl_path)
 
-    assert n_train == len(train_labels), "Train image/label count mismatch"
-    assert n_test == len(test_labels), "Test image/label count mismatch"
-    assert rows == 28 and cols == 28, f"Unexpected image size: {rows}x{cols}"
+    assert len(images) == len(labels), f"Mismatch: {len(images)} images, {len(labels)} labels"
 
-    train_dataset = MNISTDataset(train_images, train_labels)
-    test_dataset = MNISTDataset(test_images, test_labels)
+    if limit > 0:
+        images = images[:limit]
+        labels = labels[:limit]
 
-    print(f"MNIST loaded: {n_train} train, {n_test} test ({rows}x{cols})")
-    return train_dataset, test_dataset
+    return images, labels
+
+
+def make_batches(
+    images: List[List[float]],
+    labels: List[int],
+    batch_size: int,
+) -> List[Tuple[List[List[float]], List[int]]]:
+    """Split images and labels into batches.
+
+    Returns list of (batch_images, batch_labels) tuples.
+    """
+    batches = []
+    n = len(images)
+    for i in range(0, n, batch_size):
+        batch_imgs = images[i : i + batch_size]
+        batch_lbls = labels[i : i + batch_size]
+        batches.append((batch_imgs, batch_lbls))
+    return batches
