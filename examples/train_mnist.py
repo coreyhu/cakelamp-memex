@@ -15,9 +15,10 @@ import argparse
 import sys
 import time
 
+import cakelamp._core as _C
+from cakelamp.autograd.tensor import AutogradTensor
 from cakelamp.data.mnist import load_mnist
-from cakelamp.tensor import Tensor
-from cakelamp.nn import Module, Linear, ReLU, Sequential, CrossEntropyLoss
+from cakelamp.nn import Module, Linear, ReLU, CrossEntropyLoss
 from cakelamp.optim import SGD
 
 
@@ -40,30 +41,32 @@ class MLP(Module):
         return x
 
 
-def make_batch_tensor(batch_images, batch_labels):
-    """Convert a batch of images and labels to Tensors.
+def make_batch_tensors(batch_images, batch_labels):
+    """Convert batch of images and labels to AutogradTensors.
 
     Parameters
     ----------
     batch_images : list[list[float]]
-        Batch of flattened images, each of length 784.
+        Batch of flattened 784-pixel images.
     batch_labels : list[int]
         Batch of integer labels 0-9.
 
     Returns
     -------
-    tuple[Tensor, Tensor]
-        (images_tensor, labels_tensor)
+    tuple[AutogradTensor, AutogradTensor]
+        (images_tensor [N, 784], labels_tensor [N])
     """
     batch_size = len(batch_images)
-    # Flatten all images into one big list for the tensor
     flat_data = []
     for img in batch_images:
         flat_data.extend(img)
-    images = Tensor(flat_data, requires_grad=False,
-                    _shape=[batch_size, 784])
-    labels = Tensor([float(l) for l in batch_labels],
-                    _shape=[batch_size])
+    images = AutogradTensor(
+        _C.tensor(flat_data, [batch_size, 784]), requires_grad=False
+    )
+    labels = AutogradTensor(
+        _C.tensor([float(l) for l in batch_labels], [batch_size]),
+        requires_grad=False,
+    )
     return images, labels
 
 
@@ -75,7 +78,7 @@ def compute_accuracy(model, dataset, batch_size=256):
     model : Module
         The model to evaluate.
     dataset : MNISTDataset
-        The dataset to evaluate on.
+        Dataset to evaluate on.
     batch_size : int
         Batch size for evaluation.
 
@@ -84,23 +87,22 @@ def compute_accuracy(model, dataset, batch_size=256):
     float
         Accuracy in [0, 1].
     """
-    model.eval()
     correct = 0
     total = 0
 
     for batch_images, batch_labels in dataset.batches(batch_size, shuffle=False):
-        images, labels = make_batch_tensor(batch_images, batch_labels)
+        images, labels = make_batch_tensors(batch_images, batch_labels)
         logits = model(images)
 
-        # Argmax to get predictions
+        # Argmax along dim=1 to get predictions
         preds = logits.argmax(dim=1)
+        pred_list = preds.tolist()
         for i in range(len(batch_labels)):
-            pred_class = int(preds._contiguous_data()[i])
+            pred_class = int(pred_list[i])
             if pred_class == batch_labels[i]:
                 correct += 1
             total += 1
 
-    model.train()
     return correct / total if total > 0 else 0.0
 
 
@@ -134,10 +136,8 @@ def train(
     float
         Final test accuracy.
     """
-    # Load data
     train_data, test_data = load_mnist(data_dir=data_dir)
 
-    # Create model, loss, optimizer
     model = MLP()
     criterion = CrossEntropyLoss()
     optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
@@ -153,7 +153,7 @@ def train(
         batch_count = 0
 
         for batch_images, batch_labels in train_data.batches(batch_size, shuffle=True):
-            images, labels = make_batch_tensor(batch_images, batch_labels)
+            images, labels = make_batch_tensors(batch_images, batch_labels)
 
             # Forward pass
             optimizer.zero_grad()
@@ -202,7 +202,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
     parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
-    parser.add_argument("--data-dir", type=str, default="./data/mnist", help="MNIST data dir")
+    parser.add_argument("--data-dir", type=str, default="./data/mnist",
+                        help="MNIST data dir")
     args = parser.parse_args()
 
     accuracy = train(
