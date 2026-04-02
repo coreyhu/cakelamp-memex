@@ -18,6 +18,9 @@ from cakelamp._core import (
     arange,
 )
 
+from cakelamp import autograd, nn, optim
+from cakelamp.autograd import AutogradTensor, Function
+
 __all__ = [
     "Tensor",
     "tensor",
@@ -34,4 +37,9 @@ __all__ = [
     "log_softmax",
     "one_hot",
     "arange",
+    "autograd",
+    "nn",
+    "optim",
+    "AutogradTensor",
+    "Function",
 ]

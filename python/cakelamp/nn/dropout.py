@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 
+import cakelamp._core as _C
+from cakelamp.autograd.tensor import AutogradTensor
 from cakelamp.nn.module import Module
 
 
@@ -28,9 +30,13 @@ class Dropout(Module):
     def forward(self, input):
         if not self.training or self.p == 0.0:
             return input
-        # Generate a mask and apply it.
-        # This delegates to the tensor's dropout method.
-        return input.dropout(self.p, self.training)
+
+        # Generate mask: 1/(1-p) if kept, 0 if dropped
+        scale = 1.0 / (1.0 - self.p)
+        data = input.data.tolist()
+        mask_data = [scale if random.random() >= self.p else 0.0 for _ in data]
+        mask = AutogradTensor(_C.Tensor(mask_data, input.data.shape))
+        return input * mask
 
     def extra_repr(self) -> str:
         return f"p={self.p}"
